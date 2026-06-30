@@ -184,8 +184,6 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-TEAM_NAME = "bary"  # set this to your team name
-
 ddp = int(os.environ.get('RANK', -1)) != -1
 if ddp:
     assert torch.cuda.is_available()
@@ -232,7 +230,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073
+max_steps = 5000
 
 def get_lr(it):
     if it < warmup_steps:
@@ -274,16 +272,29 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 or last_step:
-                model_dir = f"/mnt/models/{TEAM_NAME}"
-                os.makedirs(model_dir, exist_ok=True)
+            if (step % 1000 == 0 and step > 0) or last_step:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
                     'val_loss': val_loss_accum.item(),
                 }
-                torch.save(checkpoint, os.path.join(model_dir, f"model_{step:05d}.pt"))
+                ckpt_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                torch.save(checkpoint, ckpt_path)
+                hf_token = os.environ.get('HF_TOKEN')
+                hf_repo_id = os.environ.get('HF_REPO_ID')
+                if hf_token and hf_repo_id:
+                    from huggingface_hub import HfApi
+                    api = HfApi(token=hf_token)
+                    api.create_repo(repo_id=hf_repo_id, repo_type="model", exist_ok=True)
+                    api.upload_file(
+                        path_or_fileobj=ckpt_path,
+                        path_in_repo=f"model_{step:05d}.pt",
+                        repo_id=hf_repo_id,
+                        repo_type="model",
+                        commit_message=f"step {step}, val_loss={val_loss_accum.item():.4f}",
+                    )
+                    print(f"uploaded model_{step:05d}.pt to {hf_repo_id}")
 
     model.train()
     optimizer.zero_grad()

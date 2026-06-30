@@ -183,41 +183,50 @@ tokens_per_sec = (B * T * ddp_world_size) / dt  # was B * T
 
 ---
 
-### Step 5 — Save checkpoints to the shared volume
+### Step 5 — Upload checkpoints to HuggingFace
 
-All teams share the volume mounted at `/mnt/models`. Pick a unique team name and save checkpoints into your own subdirectory so you don't overwrite each other.
+At step 1000, 2000, … 5000, save a checkpoint and upload it to your HuggingFace model repo. Only the master process does this.
 
-Add a `TEAM_NAME` constant near the top of your training script:
-
-```python
-TEAM_NAME = "your-team"  # set this before running
-```
-
-Then, inside the validation block (which already runs every 250 steps), save a checkpoint right after computing `val_loss_accum` — only from the master process:
+First, create a model repo on [huggingface.co](https://huggingface.co) (e.g. `your-username/gpt2-run`). Then, inside your validation block, add after computing `val_loss_accum`:
 
 ```python
 if master_process:
-    model_dir = f"/mnt/models/{TEAM_NAME}"
-    os.makedirs(model_dir, exist_ok=True)
-    checkpoint = {
-        'model': raw_model.state_dict(),
-        'config': raw_model.config,
-        'step': step,
-        'val_loss': val_loss_accum.item(),
-    }
-    torch.save(checkpoint, os.path.join(model_dir, f"model_{step:05d}.pt"))
+    if (step % 1000 == 0 and step > 0) or last_step:
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'config': raw_model.config,
+            'step': step,
+            'val_loss': val_loss_accum.item(),
+        }
+        ckpt_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+        torch.save(checkpoint, ckpt_path)
+        from huggingface_hub import HfApi
+        api = HfApi(token=os.environ['HF_TOKEN'])
+        api.create_repo(repo_id=os.environ['HF_REPO_ID'], repo_type="model", exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=ckpt_path,
+            path_in_repo=f"model_{step:05d}.pt",
+            repo_id=os.environ['HF_REPO_ID'],
+            repo_type="model",
+            commit_message=f"step {step}, val_loss={val_loss_accum.item():.4f}",
+        )
 ```
 
-Use `raw_model.state_dict()` (not `model.state_dict()`) to save weights without the DDP wrapper.
+Use `raw_model.state_dict()` (not `model.state_dict()`) to save weights without the DDP wrapper. `HF_TOKEN` and `HF_REPO_ID` are passed as environment variables at job launch — see the Nebius command below.
 
 ---
 
 ### Step 6 — Evaluate: generation and HellaSwag
 
-After training, run `eval_1_3.py` on a single GPU to load a checkpoint, generate text, and score on HellaSwag:
+After training, run `eval_1_3.py` on a single GPU to load a checkpoint from HuggingFace, generate text, and score on HellaSwag:
 
 ```bash
-python eval_1_3.py --checkpoint /mnt/models/<your-team>/model_01000.pt
+python eval_1_3.py --hf-repo <your-hf-username>/<your-repo-name> --hf-file model_05000.pt
+```
+
+Or from a local file:
+```bash
+python eval_1_3.py --checkpoint log/model_05000.pt
 ```
 
 The script will:
@@ -225,12 +234,18 @@ The script will:
 2. Generate 5 continuations of `"Hello, I'm a language model,"` using top-50 sampling.
 3. Run the full HellaSwag validation set (10,042 examples) and report normalized accuracy.
 
-A randomly-initialized GPT-2 scores ~25% (chance = 25% for 4-way choice). After a short run you should already see improvement; the full 1-epoch trained model reaches ~30%.
+A randomly-initialized GPT-2 scores ~25% (chance = 25% for 4-way choice). After 5000 steps the model should reach ~30%.
 
 ---
 
 ### Launch with torchrun on Nebius (8 H100 GPUs)
 
+First export your HuggingFace token locally:
+```bash
+export HF_TOKEN=hf_...
+```
+
+Then submit the job:
 ```bash
 nebius ai job create \
     --name ex1-3-<your-name> \
@@ -240,11 +255,12 @@ nebius ai job create \
     --platform gpu-h100-sxm \
     --preset 8gpu-128vcpu-1600gb \
     --timeout 30m \
-    --volume computefilesystem-e00hnnpfn5rr5aavma:/mnt/data \
-    --volume computefilesystem-e00yzm564mmdvedbsj:/mnt/models
+    --env HF_TOKEN=$HF_TOKEN \
+    --env HF_REPO_ID=<your-hf-username>/<your-repo-name> \
+    --volume computefilesystem-e00hnnpfn5rr5aavma:/mnt/data
 ```
 
-Note: the platform changes from `gpu-l40s-d` to `gpu-h100-sxm`. Two volumes are mounted: `/mnt/data` for the training data and `/mnt/models` for shared checkpoint storage.
+`$HF_TOKEN` is read from your local shell and injected into the job container. `HF_REPO_ID` should match the repo you created on HuggingFace.
 
 ---
 
@@ -252,5 +268,5 @@ Note: the platform changes from `gpu-l40s-d` to `gpu-h100-sxm`. Two volumes are 
 
 - The `tok/sec` throughput should be close to 8× what you saw on a single GPU.
 - All 8 processes compute the same loss at every step (because of the `all_reduce`), but only rank 0 prints and writes to the log file.
-- After training, checkpoint files appear in `/mnt/models/<your-team>/`.
+- Checkpoints appear in your HuggingFace repo at steps 1000, 2000, 3000, 4000, and 5000.
 

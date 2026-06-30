@@ -1,11 +1,14 @@
 """
 Evaluate a saved GPT-2 checkpoint: generate text samples and score on HellaSwag.
 
-Usage:
-    python eval_1_3.py --checkpoint /mnt/models/<your-team>/model_01000.pt
+Usage (from HuggingFace):
+    python eval_1_3.py --hf-repo your-username/your-repo --hf-file model_05000.pt
+
+Usage (local file):
+    python eval_1_3.py --checkpoint log/model_05000.pt
 """
 import argparse
-import math
+import os
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -91,7 +94,7 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
 
     def forward(self, idx, targets=None):
-        B, T = idx.size()
+        _, T = idx.size()
         assert T <= self.config.block_size
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         x = self.transformer.wpe(pos) + self.transformer.wte(idx)
@@ -137,8 +140,9 @@ def generate(model, device, enc, prompt="Hello, I'm a language model,", num_sequ
     tokens = tokens.unsqueeze(0).repeat(num_sequences, 1)
     rng = torch.Generator(device=device)
     rng.manual_seed(42)
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
     with torch.no_grad():
-        with torch.autocast(device_type="cuda" if device.startswith("cuda") else "cpu", dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             while tokens.size(1) < max_length:
                 logits, _ = model(tokens)
                 logits = logits[:, -1, :]
@@ -172,11 +176,25 @@ def evaluate_hellaswag(model, device):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True, help="path to .pt checkpoint file")
+    parser.add_argument("--checkpoint", help="path to local .pt checkpoint file")
+    parser.add_argument("--hf-repo", help="HuggingFace repo id (e.g. username/repo-name)")
+    parser.add_argument("--hf-file", default="model_05000.pt", help="filename within the HF repo")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    if args.hf_repo:
+        from huggingface_hub import hf_hub_download
+        checkpoint_path = hf_hub_download(
+            repo_id=args.hf_repo,
+            filename=args.hf_file,
+            token=os.environ.get('HF_TOKEN'),
+        )
+    elif args.checkpoint:
+        checkpoint_path = args.checkpoint
+    else:
+        parser.error("provide either --checkpoint or --hf-repo")
+
     enc = tiktoken.get_encoding("gpt2")
-    model = load_model(args.checkpoint, args.device)
+    model = load_model(checkpoint_path, args.device)
     generate(model, args.device, enc)
     evaluate_hellaswag(model, args.device)
